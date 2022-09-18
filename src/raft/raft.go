@@ -677,9 +677,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		// 如果接收者日志中没有包含这样一个条目 即该条目的任期在 prevLogIndex 上能和 prevLogTerm 匹配上,则返回假
 		reply.Success = false
-		// 优化，返回冲突的任期对应的最小索引位置
-		if lastLogIndex >= args.PrevLogIndex && args.PrevLogTerm != 0 {
+		// 情况1 如果不包含leader的日志说明当前的节点比较落后，直接将冲突位置置为当前日志的最长位置，等待下一次RPC发来请求再做比对
+		if lastLogIndex < args.PrevLogIndex {
+			reply.ConflictIndex = lastLogIndex
+			reply.ConflictTerm = 0
+		} else {
+			// 情况2，如果出现的是任期冲突，则记录冲突任期，冲突位置假设成当前任期的第一个元素开始
 			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			// 实际情况下倒着查找可能更快一些
 			for i := lastLogIndex; i > 0; i-- {
 				if rf.log[i].Term == reply.ConflictTerm {
 					reply.ConflictIndex = i
@@ -737,21 +742,29 @@ func (rf *Raft) handleCopyLogResult(serverId int, args *AppendEntriesArgs, reply
 			rf.persist()
 			return
 		}
-		// 查找冲突的记录
-		sm := reply.ConflictIndex
-		if reply.ConflictTerm != 0 {
-			for i := 1; i < len(rf.log); i++ {
-				if rf.log[i].Term != reply.ConflictTerm {
-					continue
+		// 如果是follower包含了冲突的term，follower中的日志不一定全都冲突，所以重置到leader的对应任期的最大位置
+		if reply.ConflictTerm == 0 {
+			// 情况1: follower的日志落后较多，不包含leader发送过去的数据，需要从follower缺失数据的位置重新发送
+			rf.nextIndex[serverId] = reply.ConflictIndex
+		} else {
+			// follower返回了对应preLogIndex对应的冲突任期，需要看leader中是否有对应的任期数据
+			conflictIndex := 0
+			for i := args.PrevLogIndex; i > 0; i-- {
+				if rf.log[i].Term == reply.ConflictTerm {
+					conflictIndex = i
+					break
 				}
-				for i < len(rf.log) && rf.log[i].Term == reply.ConflictTerm {
-					i++
+				if rf.log[i].Term < reply.ConflictTerm {
+					break
 				}
-				sm = i
-				break
+			}
+			if conflictIndex != 0 {
+				rf.nextIndex[serverId] = conflictIndex
+			} else {
+				rf.nextIndex[serverId] = reply.ConflictIndex
 			}
 		}
-		rf.nextIndex[serverId] = sm
+
 		//if rf.nextIndex[serverId] > 1 {
 		//	rf.nextIndex[serverId] = rf.nextIndex[serverId] - 1
 		//}

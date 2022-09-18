@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"encoding/json"
 	"log"
 	"math/rand"
@@ -145,6 +147,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -165,6 +174,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("读取持久化信息异常")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.voteFor = voteFor
+		rf.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -215,7 +238,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.currentTerm < args.Term {
 		rf.changeState(FOLLOWER)
 		rf.currentTerm = args.Term
-		rf.voteFor = -1
+		// 需要持久化信息
+		rf.persist()
 	}
 
 	// 检查任期和当前节点的投票情况
@@ -228,6 +252,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 日志匹配检查
 	if rf.checkLogIsLatest(args.LastLogIndex, args.LastLogTerm) {
 		rf.voteFor = args.CandidateId
+		// 需要持久化信息
+		rf.persist()
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		// 投票后要更新自己的下一次选举时间
@@ -310,6 +336,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		if reply.Term > rf.currentTerm {
 			rf.changeState(FOLLOWER)
 			rf.currentTerm = reply.Term
+			// 需要持久化信息
+			rf.persist()
 		}
 	}
 	rf.mu.Unlock()
@@ -351,6 +379,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		index = len(rf.log) - 1
 		term = rf.currentTerm
+		// 需要持久化信息
+		rf.persist()
 		// 添加日志到其他节点
 		log.Printf("LEADER %d接收倒了新日志[%v]，分配索引%d和任期%d", rf.me, command, index, term)
 	}
@@ -433,10 +463,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0 // 任期初始化为0
-	rf.voteFor = -1
-	rf.log = make([]LogEntry, 1) // 初始化log，索引从1开始，索引为0表示空
-	rf.log[0].Term = 0
+	// 加载持久化的信息
+	persistData := rf.persister.ReadRaftState()
+	if persistData != nil && len(persistData) > 0 {
+		rf.readPersist(persistData)
+	} else {
+		rf.currentTerm = 0 // 任期初始化为0
+		rf.voteFor = -1
+		rf.log = make([]LogEntry, 1) // 初始化log，索引从1开始，索引为0表示空
+		rf.log[0].Term = 0
+	}
 
 	// 初始化已提交记录索引和已应用索引位置为0
 	rf.lastApplied = 0
@@ -461,6 +497,9 @@ func (rf *Raft) changeState(state int) {
 		rf.state = FOLLOWER
 		// 清空投票信息
 		rf.voteFor = -1 // -1 表示没有给任何人投票
+		// 投票信息已经清空，需要持久化信息
+		rf.persist()
+
 		rf.voteCount = 0
 		// 关闭leader节点的心跳任务和日志复制任务
 		rf.setTaskFlag(&rf.runHeartbeatTask, 0)
@@ -473,6 +512,8 @@ func (rf *Raft) changeState(state int) {
 		rf.currentTerm = rf.currentTerm + 1
 		// 给自己投票
 		rf.voteFor = rf.me
+		// 需要持久化信息
+		rf.persist()
 		rf.voteCount = 1
 		// 重置选举超时计时器
 		rf.resetElectionTimeout()
@@ -581,6 +622,8 @@ func (rf *Raft) sendHeartbeat(serverId int) {
 				// 状态回到FOLLOWER
 				rf.changeState(FOLLOWER)
 				rf.currentTerm = reply.Term
+				// 需要持久化信息
+				rf.persist()
 			}
 		}
 		rf.mu.Unlock()
